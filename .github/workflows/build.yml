@@ -10,42 +10,64 @@ permissions:
   contents: write
 
 jobs:
-  # ============================================================
-  # Job 2: OpenWrt MUSL + CGO build (libpcap-compatible)
-  # ============================================================
   openwrt-musl-cgo:
-    name: OpenWrt musl + CGO
+    name: OpenWrt musl + CGO (${{ matrix.filename }})
     runs-on: ubuntu-latest
-    container:
-      image: golang:1.25-alpine
 
     strategy:
       matrix:
         include:
           - goarch: arm64
             filename: arm64
+            cc: aarch64-linux-musl-gcc
+            cross_pkg: aarch64-linux-musl-cross
+            goarm: ""
           - goarch: arm
             filename: arm32
+            cc: arm-linux-musleabihf-gcc
+            cross_pkg: arm-linux-musleabihf-cross
             goarm: "7"
 
     steps:
-      - name: Install build deps
-        run: |
-          apk add --no-cache \
-            git \
-            build-base \
-            libpcap-dev \
-            musl-dev
-
       - name: Checkout code
-        uses: actions/checkout@v5
-        
-      - name: Mark repo as safe
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Install musl cross-compiler toolchain
+        run: |
+          sudo mkdir -p /opt/cross
+          # Download musl.cc prebuilt cross toolchain
+          wget -q "https://musl.cc/${{ matrix.cross_pkg }}.tgz" -O /tmp/cross.tgz
+          sudo tar -xzf /tmp/cross.tgz -C /opt/cross --strip-components=1
+          echo "/opt/cross/bin" >> $GITHUB_PATH
+
+      - name: Install libpcap (cross-compile from source)
+        run: |
+          # We need libpcap headers and a static lib built for the target arch
+          sudo apt-get update
+          sudo apt-get install -y flex bison
+
+          LIBPCAP_VERSION="1.10.5"
+          wget -q "https://www.tcpdump.org/release/libpcap-${LIBPCAP_VERSION}.tar.xz" -O /tmp/libpcap.tar.xz
+          tar -xf /tmp/libpcap.tar.xz -C /tmp
+          cd /tmp/libpcap-${LIBPCAP_VERSION}
+
+          export CC=${{ matrix.cc }}
+          ./configure --host=$(echo "${{ matrix.cc }}" | sed 's/-gcc$//') \
+            --prefix=/opt/cross-sysroot \
+            --with-pcap=linux \
+            --disable-shared \
+            --disable-dbus \
+            --without-libnl
+          make -j$(nproc)
+          sudo make install
 
       - name: Get tag or commit
         id: ref_id
-        shell: sh
         run: |
           if echo "$GITHUB_REF" | grep -q '^refs/tags/'; then
             REF_ID="${GITHUB_REF#refs/tags/}"
@@ -55,28 +77,31 @@ jobs:
           echo "ref=$REF_ID" >> $GITHUB_OUTPUT
 
       - name: Build musl CGO OpenWrt binary
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CC: ${{ matrix.cc }}
+          CGO_CFLAGS: "-I/opt/cross-sysroot/include"
+          CGO_LDFLAGS: "-L/opt/cross-sysroot/lib -static"
         run: |
           mkdir -p dist
-
-          export CGO_ENABLED=1
-          export GOOS=linux
-          export GOARCH=${{ matrix.goarch }}
-          export GOARM=${{ matrix.goarm }}
-          export VERSION=${{ steps.ref_id.outputs.ref }}
-          export GIT_COMMIT=$(git rev-parse HEAD || echo unknown)
-          export GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo unknown)
-          export BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          VERSION=${{ steps.ref_id.outputs.ref }}
+          GIT_COMMIT=$(git rev-parse HEAD || echo unknown)
+          GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo unknown)
+          BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
           go build -v -trimpath \
             -ldflags "-s -w \
               -X 'paqet/cmd/version.Version=${VERSION}' \
               -X 'paqet/cmd/version.GitCommit=${GIT_COMMIT}' \
               -X 'paqet/cmd/version.GitTag=${GIT_TAG}' \
-              -X 'paqet/cmd/version.BuildTime=${BUILD_TIME}'" \
+              -X 'paqet/cmd/version.BuildTime=${BUILD_TIME}' \
+              -linkmode external -extldflags '-static'" \
             -o paqet_openwrt_musl_${{ matrix.filename }} ./cmd/main.go
 
           chmod +x paqet_openwrt_musl_${{ matrix.filename }}
-
           tar -czf dist/paqet-openwrt-musl-${{ matrix.filename }}-${VERSION}.tar.gz \
             paqet_openwrt_musl_${{ matrix.filename }} \
             README.md \
