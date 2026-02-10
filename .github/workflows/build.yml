@@ -43,6 +43,9 @@ jobs:
           fi
           echo "ref=$REF_ID" >> $GITHUB_OUTPUT
 
+      - name: Mark repo as safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        
       - name: Build static OpenWrt binary
         run: |
           mkdir -p dist
