@@ -11,78 +11,6 @@ permissions:
 
 jobs:
   # ============================================================
-  # Job 1: OpenWrt STATIC build (NO CGO)
-  # ============================================================
-  openwrt-static:
-    name: OpenWrt Static (no CGO)
-    runs-on: ubuntu-latest
-    container:
-      image: golang:1.25
-
-    strategy:
-      matrix:
-        include:
-          - goarch: arm64
-            filename: arm64
-          - goarch: arm
-            filename: arm32
-            goarm: "7"
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-      
-      - name: Mark repo as safe
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Get tag or commit
-        id: ref_id
-        shell: bash
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            REF_ID="${GITHUB_REF#refs/tags/}"
-          else
-            REF_ID=$(git rev-parse --short HEAD)
-          fi
-          echo "ref=$REF_ID" >> $GITHUB_OUTPUT
-        
-      - name: Build static OpenWrt binary
-        run: |
-          mkdir -p dist
-
-          export CGO_ENABLED=0
-          export GOOS=linux
-          export GOARCH=${{ matrix.goarch }}
-          export GOARM=${{ matrix.goarm }}
-          export VERSION=${{ steps.ref_id.outputs.ref }}
-          export GIT_COMMIT=$(git rev-parse HEAD || echo unknown)
-          export GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo unknown)
-          export BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
-
-          go build -v -trimpath \
-            -ldflags "-s -w \
-              -X 'paqet/cmd/version.Version=${VERSION}' \
-              -X 'paqet/cmd/version.GitCommit=${GIT_COMMIT}' \
-              -X 'paqet/cmd/version.GitTag=${GIT_TAG}' \
-              -X 'paqet/cmd/version.BuildTime=${BUILD_TIME}'" \
-            -o paqet_openwrt_static_${{ matrix.filename }} ./cmd/main.go
-
-          chmod +x paqet_openwrt_static_${{ matrix.filename }}
-
-          tar -czf dist/paqet-openwrt-static-${{ matrix.filename }}-${VERSION}.tar.gz \
-            paqet_openwrt_static_${{ matrix.filename }} \
-            README.md \
-            example/client.yaml.example \
-            example/server.yaml.example
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: paqet-openwrt-static-${{ matrix.filename }}
-          path: dist/*.tar.gz
-
-
-  # ============================================================
   # Job 2: OpenWrt MUSL + CGO build (libpcap-compatible)
   # ============================================================
   openwrt-musl-cgo:
@@ -134,7 +62,6 @@ jobs:
           export GOOS=linux
           export GOARCH=${{ matrix.goarch }}
           export GOARM=${{ matrix.goarm }}
-          export CC=musl-gcc
           export VERSION=${{ steps.ref_id.outputs.ref }}
           export GIT_COMMIT=$(git rev-parse HEAD || echo unknown)
           export GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo unknown)
