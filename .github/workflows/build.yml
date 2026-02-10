@@ -7,106 +7,96 @@ on:
       - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   openwrt-musl-cgo:
-    name: OpenWrt musl + CGO (${{ matrix.filename }})
+    name: OpenWrt musl + CGO
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - goarch: arm64
+          - platform: linux/arm64
+            goarch: arm64
             filename: arm64
-            cc: aarch64-linux-musl-gcc
-            cross_pkg: aarch64-linux-musl-cross
-            goarm: ""
-          - goarch: arm
-            filename: arm32
-            cc: arm-linux-musleabihf-gcc
-            cross_pkg: arm-linux-musleabihf-cross
+          - platform: linux/arm/v7
+            goarch: arm
             goarm: "7"
+            filename: arm32
 
     steps:
-      - name: Checkout code
+      - name: Checkout code (need tags for git describe)
         uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          fetch-depth: 0
 
-      - name: Install musl cross-compiler toolchain
-        run: |
-          sudo mkdir -p /opt/cross
-          # Download musl.cc prebuilt cross toolchain
-          wget -q "https://musl.cc/${{ matrix.cross_pkg }}.tgz" -O /tmp/cross.tgz
-          sudo tar -xzf /tmp/cross.tgz -C /opt/cross --strip-components=1
-          echo "/opt/cross/bin" >> $GITHUB_PATH
-
-      - name: Install libpcap (cross-compile from source)
-        run: |
-          # We need libpcap headers and a static lib built for the target arch
-          sudo apt-get update
-          sudo apt-get install -y flex bison
-
-          LIBPCAP_VERSION="1.10.5"
-          wget -q "https://www.tcpdump.org/release/libpcap-${LIBPCAP_VERSION}.tar.xz" -O /tmp/libpcap.tar.xz
-          tar -xf /tmp/libpcap.tar.xz -C /tmp
-          cd /tmp/libpcap-${LIBPCAP_VERSION}
-
-          export CC=${{ matrix.cc }}
-          ./configure --host=$(echo "${{ matrix.cc }}" | sed 's/-gcc$//') \
-            --prefix=/opt/cross-sysroot \
-            --with-pcap=linux \
-            --disable-shared \
-            --disable-dbus \
-            --without-libnl
-          make -j$(nproc)
-          sudo make install
+      - name: Enable QEMU for multi-arch containers
+        uses: docker/setup-qemu-action@v3
 
       - name: Get tag or commit
         id: ref_id
+        shell: bash
         run: |
-          if echo "$GITHUB_REF" | grep -q '^refs/tags/'; then
-            REF_ID="${GITHUB_REF#refs/tags/}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "ref=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
-            REF_ID=$(git rev-parse --short HEAD)
+            echo "ref=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           fi
-          echo "ref=$REF_ID" >> $GITHUB_OUTPUT
 
-      - name: Build musl CGO OpenWrt binary
+      - name: Build musl CGO OpenWrt binary (${{ matrix.platform }})
+        shell: bash
         env:
-          CGO_ENABLED: "1"
-          GOOS: linux
+          PLATFORM: ${{ matrix.platform }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
-          CC: ${{ matrix.cc }}
-          CGO_CFLAGS: "-I/opt/cross-sysroot/include"
-          CGO_LDFLAGS: "-L/opt/cross-sysroot/lib -static"
+          FILENAME: ${{ matrix.filename }}
+          VERSION: ${{ steps.ref_id.outputs.ref }}
         run: |
+          set -euo pipefail
           mkdir -p dist
-          VERSION=${{ steps.ref_id.outputs.ref }}
-          GIT_COMMIT=$(git rev-parse HEAD || echo unknown)
-          GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo unknown)
-          BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
-          go build -v -trimpath \
-            -ldflags "-s -w \
-              -X 'paqet/cmd/version.Version=${VERSION}' \
-              -X 'paqet/cmd/version.GitCommit=${GIT_COMMIT}' \
-              -X 'paqet/cmd/version.GitTag=${GIT_TAG}' \
-              -X 'paqet/cmd/version.BuildTime=${BUILD_TIME}' \
-              -linkmode external -extldflags '-static'" \
-            -o paqet_openwrt_musl_${{ matrix.filename }} ./cmd/main.go
+          EXTRA_ENV=()
+          if [[ -n "${GOARM:-}" ]]; then
+            EXTRA_ENV+=(-e GOARM="$GOARM")
+          fi
 
-          chmod +x paqet_openwrt_musl_${{ matrix.filename }}
-          tar -czf dist/paqet-openwrt-musl-${{ matrix.filename }}-${VERSION}.tar.gz \
-            paqet_openwrt_musl_${{ matrix.filename }} \
-            README.md \
-            example/client.yaml.example \
-            example/server.yaml.example
+          docker run --rm --platform="$PLATFORM" \
+            -v "$PWD:/src" -w /src \
+            -e CGO_ENABLED=1 \
+            -e GOOS=linux \
+            -e GOARCH="$GOARCH" \
+            -e VERSION="$VERSION" \
+            "${EXTRA_ENV[@]}" \
+            golang:1.25-alpine sh -euxc '
+              apk add --no-cache git build-base libpcap-dev musl-dev
+
+              # avoid "dubious ownership" when running git inside container
+              git config --global --add safe.directory /src
+
+              GIT_COMMIT=$(git rev-parse HEAD || echo unknown)
+              GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo unknown)
+              BUILD_TIME=$(date -u "+%Y-%m-%d %H:%M:%S UTC")
+
+              OUT="paqet_openwrt_musl_'$FILENAME'"
+
+              go build -v -trimpath \
+                -ldflags "-s -w \
+                  -X '\''paqet/cmd/version.Version=${VERSION}'\'' \
+                  -X '\''paqet/cmd/version.GitCommit=${GIT_COMMIT}'\'' \
+                  -X '\''paqet/cmd/version.GitTag=${GIT_TAG}'\'' \
+                  -X '\''paqet/cmd/version.BuildTime=${BUILD_TIME}'\''" \
+                -o "$OUT" ./cmd/main.go
+
+              chmod +x "$OUT"
+
+              tar -czf "dist/paqet-openwrt-musl-'$FILENAME'-${VERSION}.tar.gz" \
+                "$OUT" \
+                README.md \
+                example/client.yaml.example \
+                example/server.yaml.example
+            '
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
