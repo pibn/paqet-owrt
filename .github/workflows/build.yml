@@ -230,7 +230,7 @@ jobs:
                   path: dist/paqet-darwin-${{ matrix.goarch }}-${{ steps.ref_id.outputs.ref }}.tar.gz
                   retention-days: 1
   
-      build-openwrt-musl:
+    build-openwrt-musl:
         runs-on: ubuntu-latest
         strategy:
           matrix:
